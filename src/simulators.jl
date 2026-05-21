@@ -908,13 +908,15 @@ end
                            init_step::Integer=0,
                            show_progress=default_show_progress(),
                            rng=Random.default_rng(),
-                           strictness=default_strictness())
+                           strictness=default_strictness(),
+                           trajectory_reweighting=NoReweighting())
     check_strictness(strictness)
     if length(sys.constraints) > 0
         err_str = "OverdampedLangevin is not currently compatible with constraints, " *
                   "constraints will be ignored"
         report_issue(err_str, strictness)
     end
+
     n_steps = calc_n_steps(n_steps_or_time, sim.dt)
     sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
     place_virtual_sites!(sys)
@@ -934,6 +936,16 @@ end
         accels_t .= calc_accels.(forces_t, masses(sys))
 
         random_velocities!(noise, sys, sim.temperature; rng=rng)
+
+        _reweighting_callback!(trajectory_reweighting,
+                            noise,
+                            sys,
+                            sim,
+                            step_n,
+                            n_threads,
+                            buffers,
+                            neighbors)
+
         sys.coords .+= (accels_t ./ sim.friction) .* sim.dt .+ noise_prefac .* noise
         sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
         place_virtual_sites!(sys)
@@ -947,6 +959,8 @@ end
 
         apply_loggers!(sys, buffers, neighbors, step_n, run_loggers; n_threads=n_threads,
                        current_forces=forces_t)
+
+
         if shortcut_sim(shortcut, sys, buffers, neighbors, step_n; n_threads=n_threads,
                         current_forces=forces_t)
             break
