@@ -770,7 +770,8 @@ end
                            init_step::Integer=0,
                            show_progress=default_show_progress(),
                            rng=Random.default_rng(),
-                           strictness=default_strictness())
+                           strictness=default_strictness(),
+                           trajectory_reweighting=NoReweighting())
     check_strictness(strictness)
     if length(sys.constraints) > 0
         err_str = "LangevinSplitting is not currently compatible with constraints, " *
@@ -828,8 +829,19 @@ end
 
     progress = setup_progress(n_steps, show_progress)
     for step_n in (init_step + 1):(init_step + n_steps)
-        for (step!, args) in step_arg_pairs
+        for (op_index,(step!, args)) in enumerate(step_arg_pairs)
             step!(args..., neighbors, step_n)
+            _reweighting_callback!(trajectory_reweighting,
+                            noise,
+                            sys,
+                            sim,
+                            step_n,
+                            n_threads,
+                            buffers,
+                            neighbors,
+                            op_index,
+                            α_eff,
+                            σ_eff)
         end
 
         sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
