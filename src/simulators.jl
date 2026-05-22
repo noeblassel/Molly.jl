@@ -834,14 +834,11 @@ end
             _reweighting_callback!(trajectory_reweighting,
                             noise,
                             sys,
-                            sim,
                             step_n,
                             n_threads,
                             buffers,
                             neighbors,
-                            op_index,
-                            α_eff,
-                            σ_eff)
+                            op_index)
         end
 
         sys.coords .= wrap_coords.(sys.coords, (sys.boundary,))
@@ -952,7 +949,6 @@ end
         _reweighting_callback!(trajectory_reweighting,
                             noise,
                             sys,
-                            sim,
                             step_n,
                             n_threads,
                             buffers,
