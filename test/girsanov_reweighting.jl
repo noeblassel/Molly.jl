@@ -1,4 +1,76 @@
-@testset "Girsanov Reweighting 1D" begin
+@testset "Girsanov functionality / unit compatibility" begin
+
+    struct ConstantDrift{T}
+        f::SVector{3,T}
+    end
+
+    function AtomsCalculators.forces!(fs,
+        sys,
+        inter::ConstantDrift
+        ;
+        kwargs...)
+        fs[1] = fs[1] + inter.f
+        return fs
+    end
+
+    n_atoms = 100
+    n_steps = 200
+    temp = 300.0u"K"
+    boundary = CubicBoundary(10.0u"nm")
+    coords = place_atoms(n_atoms, boundary; min_dist=0.3u"nm")
+    velocities = [random_velocity(10.0u"g/mol", temp) .* 0.01 for i in 1:n_atoms]
+    atoms = [Atom(mass=10.0u"g/mol", charge=0.0, σ=0.3u"nm", ϵ=0.2u"kJ * mol^-1")
+             for i in 1:n_atoms]
+
+
+    make_system() = System(
+        atoms=atoms,
+        coords=copy(coords),
+        boundary=boundary,
+        velocities=copy(velocities),
+        pairwise_inters=(LennardJones(use_neighbors=true),),
+        neighbor_finder=DistanceNeighborFinder(
+            eligible=trues(n_atoms, n_atoms),
+            n_steps=10,
+            dist_cutoff=2.0u"nm",
+        ),)
+
+    biasing_forces = [ConstantDrift(
+        SVector(1.0, 0.0, 0.0) .* u"kJ * mol^-1 * nm^-1")]
+
+    @testset "OverdampedLangevinReweighting with units" begin
+        sys = make_system()
+        simulator = OverdampedLangevin(; dt=0.002u"ps", temperature=temp,
+            friction=1.0u"ps^-1", remove_CM_motion=false)
+        rw = OverdampedLangevinReweighting(sys, simulator, biasing_forces)
+
+        simulate!(sys, simulator, n_steps; trajectory_reweighting=rw,
+            rng=MersenneTwister(2026))
+
+        @test length(rw.log_weights) == n_steps
+        @test eltype(rw.log_weights) <: Real
+        @test all(isfinite, rw.log_weights)
+    end
+
+    @testset "ABOBA LangevinSplittingReweighting with units" begin
+        sys = make_system()
+        simulator = LangevinSplitting(dt=0.002u"ps", temperature=temp,
+            friction=10.0u"g * mol^-1 * ps^-1",
+            splitting="ABOBA", remove_CM_motion=false)
+        rw = LangevinSplittingReweighting("ABOBA", sys, simulator, biasing_forces)
+
+        simulate!(sys, simulator, n_steps; trajectory_reweighting=rw,
+            rng=MersenneTwister(2026))
+
+        @test length(rw.log_weights) == n_steps
+        @test eltype(rw.log_weights) <: Real
+        @test all(isfinite, rw.log_weights)
+    end
+
+end
+
+
+@testset "Girsanov validation 1D" begin
 
     """
     A harmonic potential with stifness h
@@ -50,11 +122,9 @@
         return sys
     end
 
-    @testset "Validation of Girsanov reweighting (OverdampedLangevinReweighting)" begin
+    @testset "OverdampedLangevinReweighting validation" begin
         n_samps = 10000
         n_steps = 300
-        nσ = 3
-
         tol = 0.1
 
         rng = Xoshiro(2026)
@@ -74,9 +144,9 @@
         for i = 1:n_samps
 
             sys = harmonic_oscillator(h0; temp=temp, rng=rng)
-            rw_girsanov = OverdampedLangevinReweighting(sys,biasing_forces)
-
             simulator = OverdampedLangevin(; dt=dt, temperature=temp, friction=1.0, remove_CM_motion=false)
+            rw_girsanov = OverdampedLangevinReweighting(sys, simulator, biasing_forces)
+
             simulate!(sys, simulator, n_steps; trajectory_reweighting=rw_girsanov)
 
             weights = exp.(rw_girsanov.log_weights)
@@ -91,11 +161,10 @@
         acf_hat_h1 = mean(rw_acfs)
 
         times = dt * (1:n_steps)
-
         acf_ana_h1 = acf.(h1, times, temp)
-        ci_ana_h1 = (nσ / sqrt(n_samps)) * std_acf.(h1, times, temp) # confidence band
 
-        @test all(i -> abs(acf_hat_h1[i] - acf_ana_h1[i]) < ci_ana_h1[i], 1:n_steps)
+        @test all(i -> abs(acf_hat_h1[i] - acf_ana_h1[i]) < tol, 1:n_steps)
+        println(maximum(abs,acf_hat_h1 - acf_ana_h1))
 
     end
 
@@ -105,7 +174,7 @@
 
             n_samps = 10000
             n_steps = 300
-            nσ = 3
+            tol = 0.1
 
             rng = Xoshiro(2026)
 
@@ -140,9 +209,8 @@
             for i = 1:n_samps
 
                 sys = harmonic_oscillator(h0; temp=temp, rng=rng)
-                rw_girsanov = LangevinSplittingReweighting("ABOBA", sys, biasing_forces)
-
-                simulator = LangevinSplitting(dt=dt, temperature=temp, friction=γ, splitting="ABOBA",remove_CM_motion=false)
+                simulator = LangevinSplitting(dt=dt, temperature=temp, friction=γ, splitting="ABOBA", remove_CM_motion=false)
+                rw_girsanov = LangevinSplittingReweighting("ABOBA", sys, simulator, biasing_forces)
                 simulate!(sys, simulator, n_steps; trajectory_reweighting=rw_girsanov)
 
                 weights = exp.(rw_girsanov.log_weights)
@@ -156,17 +224,14 @@
             end
 
             vacf_hat_h1 = mean(rw_vacfs)
-            vacf_hat_h0 = mean(vacfs)
 
             times = dt * (1:n_steps)
-
-            f0 = harmonic_vacf(γ,1/temp,h0)
-            f1 = harmonic_vacf(γ,1/temp,h1)
-
-            vacf_ana_h0 = f0.(times)
+            f1 = harmonic_vacf(γ, 1 / temp, h1)
             vacf_ana_h1 = f1.(times)
-        
-            @test all(i -> abs(acf_hat_h1[i] - acf_ana_h1[i]) < tol, 1:n_steps)
+
+            @test all(i -> abs(vacf_hat_h1[i] - vacf_ana_h1[i]) < tol, 1:n_steps)
+                    println(maximum(abs,vacf_hat_h1 - vacf_ana_h1))
+
 
         end
 
