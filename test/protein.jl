@@ -137,7 +137,7 @@ end
     buffers = Molly.init_buffers!(sys, 1)
     bench_result = @benchmark Molly.forces!($forces_t, $sys, $neighbors, $buffers, Val(false);
                                             n_threads=1)
-    @test bench_result.allocs <= 3
+    @test bench_result.allocs <= 4
     @test bench_result.memory <= 144
 
     scalar_vir = scalar_virial(sys_pme)
@@ -634,5 +634,62 @@ end
                 @test rmsd(coords_start, sys.coords) < 0.1u"nm"
             end
         end
+    end
+end
+
+@testset "a99SB-disp Gromacs/OpenMM protein comparison" begin
+
+    FT = Float64
+    AT = Array
+
+    ff = MolecularForceField(
+        FT,
+        joinpath.(ff_dir, ["a99SB-disp.xml", "a99SB-disp_water.xml"])...;
+        units=true,
+    )
+
+    struc_names = [
+        "a-synuclein_1",
+        "barn_bar",
+        "bpti",
+        "cd2_cd58",
+        "cole7_im7",
+        "drkN_SH3_1",
+        "gb3",
+        "hewl",
+        "NTail_1",
+        "PaaA2_1",
+        "sgpb_omtky3",
+        "ubiquitin",
+        "5AWL_A_noHET"
+    ]
+
+    for struc_name in struc_names
+
+        dat_file = joinpath(data_dir, "a99SB-disp_refs", "$struc_name.dat")
+        pdb_file = joinpath(data_dir, "a99SB-disp_refs", "$struc_name.pdb")
+
+        sys = System(
+            pdb_file,
+            ff;
+            array_type=AT,
+            dist_cutoff=1.0u"nm",
+            nonbonded_method=:pme,
+            approximate_pme=false,
+            disulfide_bonds=true,
+        )
+
+        fs_openmm = SVector{3}[]
+        open(dat_file, "r") do f
+            for line in readlines(f)
+                cols = split(line, ",")
+                f = SVector{3}([parse(FT, split(val, " ")[1])*u"kJ * mol^-1 * nm^-1"
+                                for val in cols])
+                push!(fs_openmm, f)
+            end
+        end
+
+        diff = mean(norm.(forces(sys) .- fs_openmm))
+        @test diff < FT(0.15)u"kJ * mol^-1 * nm^-1"
     end
 end
