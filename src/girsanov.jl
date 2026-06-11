@@ -1,5 +1,5 @@
 
-export NoReweighting, OverdampedLangevinReweighting, LangevinSplittingReweighting, MultipleOverdampedLangevinReweighting, MultipleLangevinSplittingReweighting
+export NoReweighting, TrajectoryReweighting
 
 abstract type AbstractReweighting end
 
@@ -24,31 +24,38 @@ mutable struct OverdampedLangevinReweighting{T,F,FB,PF1,PF2,IM} <: AbstractRewei
     inv_masses::IM
 end
 
+raw"""
+    TrajectoryReweighting(sys, sim; force_perturbations)
+    TrajectoryReweighting(sys, sim; feature_basis, linear_parameters)
+
+Girsanov trajectory reweighting for the [`OverdampedLangevin`](@ref) and
+[`LangevinSplitting`](@ref) simulators (`"ABOBA"` splitting). Accumulates path
+log-weights for reweighting trajectories sampled under `sim` to a target dynamics
+that differs only in its force term. Pass the result to [`simulate!`](@ref) via
+the `trajectory_reweighting` keyword; running log-weights accumulate in
+`log_weights`. Not compatible with `sim.remove_CM_motion != 0`.
+
+Provide exactly one of:
+- `force_perturbations`: an iterable of interactions giving the difference in
+  force functions between target and reference dynamics.
+  Each of these interactions should implement a method for
+  `AtomsCalculators.forces!`, see [General interactions](@ref).
+- `feature_basis` and `linear_parameters`: a callable `feature_basis(sys)`
+  returning an `(N atoms) × (N features)` array of 3-vectors (the force feature
+  matrix `D(x)`), and an
+  `(N features) × (N ensembles)` matrix `Θ`, for linear perturbations
+  ```math
+  \delta F(x) = \Theta^\top D(x)
+  ```
+  allowing efficient reweighting to many target dynamics at once.
 """
-    OverdampedLangevinReweighting(sys, sim, force_perturbations)
+struct TrajectoryReweighting{S<:AbstractReweighting,L} <: AbstractReweighting
+    scheme::S
+    log_weights::L
+end
 
-Girsanov trajectory reweighting for the [`OverdampedLangevin`](@ref) simulator.
-
-Accumulates path log-weights for future reweighting of trajectories sampled
-under `sim` to a target dynamics whose force function differs by the sum of
-`force_perturbations`. The running log-weights are stored in `log_weights`
-and updated once per step.
-Not compatible with `sim.remove_CM_motion != 0`.
-
-# Arguments
-- `sys`: the [`System`](@ref) being simulated.
-- `sim::OverdampedLangevin`: the reference simulator generating the trajectory.
-- `force_perturbations`: an iterable of interactions giving the
-    difference in force functions between the target and reference dynamics.
-
-Interactions in `force_perturbations` should implement a method for `AtomsCalculators.forces!`, see [General interactions](@ref).
-"""
-function OverdampedLangevinReweighting(sys, sim, force_perturbations)
+function _make_reweighting(sys, sim::OverdampedLangevin, force_perturbations)
     T = float_type(sys)
-
-    if !iszero(sim.remove_CM_motion)
-        throw(ArgumentError("OverdampedLangevinReweighting is not compatible with sim.remove_CM_motion = 1 "))
-    end
 
     force_buffer = zero_forces(sys)
     Δη_squared_prefactor = sim.dt / (2sim.friction * sys.k * sim.temperature)
@@ -86,26 +93,14 @@ function _reweighting_callback!(rw::OverdampedLangevinReweighting{T},
     push!(rw.log_weights, running_log_weight)
 end
 
-
-raw"""
-    MultipleOverdampedLangevinReweighting(args...)
-
-Simultaneous reweighting to multiple path ensembles, for linear perturbations of the form
-
-    ```math
-        \delta F(x) = \theta^\top D(x)
-    ```
-
-    where \(D(x)\) is a basis of descriptors, and \(\theta\) is a vector of linear weights.
-
-"""
-mutable struct MultipleOverdampedLangevinReweighting{T,FB,LP,FM,VB,GB,PF1,PF2,IM} <: AbstractReweighting
+mutable struct MultipleOverdampedLangevinReweighting{T,FB,LP,FM,SFM,VB,GB,PF1,PF2,IM} <: AbstractReweighting
     feature_basis::FB
     linear_parameters::LP
 
     log_weights::Vector{Vector{T}}
 
     feature_buffer::FM
+    scaled_feature_buffer::SFM
     v_buffer::VB
     gram_buffer::GB
     Δη_squared_prefactor::PF1
@@ -113,45 +108,23 @@ mutable struct MultipleOverdampedLangevinReweighting{T,FB,LP,FM,VB,GB,PF1,PF2,IM
     sqrt_inv_masses::IM
 end
 
-# """
-#     MultipleOverdampedLangevinReweighting(sys, sim, feature_basis, linear_parameters)
-
-# Girsanov trajectory reweighting for the [`OverdampedLangevin`](@ref) simulator.
-
-# Accumulates path log-weights for future reweighting of trajectories sampled
-# under `sim` to a target dynamics whose force function differs by the sum of
-# `force_perturbations`. The running log-weights are stored in `log_weights`
-# and updated once per step.
-# Not compatible with `sim.remove_CM_motion != 0`.
-
-# # Arguments
-# - `sys`: the [`System`](@ref) being simulated.
-# - `sim::OverdampedLangevin`: the reference simulator generating the trajectory.
-# - `force_perturbations`: an iterable of interactions giving the
-#     difference in force functions between the target and reference dynamics.
-
-# """
-function MultipleOverdampedLangevinReweighting(sys, sim, feature_basis, linear_parameters)
+function _make_reweighting(sys, sim::OverdampedLangevin, feature_basis, linear_parameters)
     T = float_type(sys)
-
-    if !iszero(sim.remove_CM_motion)
-        throw(ArgumentError("MultipleOverdampedLangevinReweighting is not compatible with sim.remove_CM_motion = 1 "))
-    end
 
     # compute force feature basis once for setup
 
     feature_buffer = zero(feature_basis(sys)) # Nat × P array of SVector{3}, where Nat is the number of atoms
 
-    if size(feature_buffer, 1) != length(sys)
-        throw(DimensionMismatch("The number of force descriptors does not match the number of atoms in the system. `force_feature_basis` should return an array of 3-vectors, of shape (N atoms) x (N features)"))
+    if (size(feature_buffer, 1) != length(sys)) || (size(feature_buffer, 2) != size(linear_parameters, 1)) || (ndims(feature_buffer) != 2)
+        throw(DimensionMismatch("Force descriptor basis has shape $(size(feature_buffer)), should be ($(length(sys)), $(size(linear_parameters,1)))."))
     end
 
     if size(first(feature_buffer)) != (size(first(sys.coords)))
-        throw(DimensionMismatch("`force_feature_basis` should return an array of vectors shaped like physical coordinates."))
+        throw(DimensionMismatch("Components of the force descriptor basis have shape $(size(first(feature_buffer))), should be $(size(first(sys.coords)))."))
     end
 
-    if size(feature_buffer, 2) != size(linear_parameters, 1)
-        throw(DimensionMismatch("`size(linear_parameters,1)` should be equal to the number of force descriptors."))
+    if ndims(linear_parameters) != 2
+        throw(DimensionMismatch("`linear_parameters` should be two-dimensional, got `ndims(linear_parameters)=$(ndims(linear_parameters))`"))
     end
 
     Δη_squared_prefactor = sim.dt / (2sim.friction * sys.k * sim.temperature)
@@ -160,9 +133,10 @@ function MultipleOverdampedLangevinReweighting(sys, sim, feature_basis, linear_p
     sqrt_inv_masses = sqrt.(inv.(sys.masses))
 
     v_buffer = feature_buffer' * sys.velocities
-    gram_buffer = zero((sqrt_inv_masses .* feature_buffer)' * (sqrt_inv_masses .* feature_buffer))
+    scaled_feature_buffer = zero(sqrt_inv_masses .* feature_buffer)
+    gram_buffer = zero(scaled_feature_buffer' * scaled_feature_buffer)
 
-    return MultipleOverdampedLangevinReweighting(feature_basis, linear_parameters, Vector{T}[], feature_buffer, v_buffer, gram_buffer, Δη_squared_prefactor, η_dot_Δη_prefactor, sqrt_inv_masses)
+    return MultipleOverdampedLangevinReweighting(feature_basis, linear_parameters, Vector{T}[], feature_buffer, scaled_feature_buffer, v_buffer, gram_buffer, Δη_squared_prefactor, η_dot_Δη_prefactor, sqrt_inv_masses)
 end
 
 function _reweighting_callback!(rw::MultipleOverdampedLangevinReweighting{T},
@@ -179,8 +153,8 @@ function _reweighting_callback!(rw::MultipleOverdampedLangevinReweighting{T},
 
     mul!(rw.v_buffer, rw.feature_buffer', noise_velocity)    # n_features
 
-    rw.feature_buffer .*= rw.sqrt_inv_masses
-    mul!(rw.gram_buffer, rw.feature_buffer', rw.feature_buffer)
+    rw.scaled_feature_buffer .= rw.sqrt_inv_masses .* rw.feature_buffer
+    mul!(rw.gram_buffer, rw.scaled_feature_buffer', rw.scaled_feature_buffer)
 
     Δη_squared = ustrip_vec(NoUnits, rw.Δη_squared_prefactor .* vec(sum(Θ .* (rw.gram_buffer * Θ); dims=1)))
     η_dot_Δη = ustrip_vec(NoUnits, rw.η_dot_Δη_prefactor .* (Θ' * rw.v_buffer))
@@ -221,40 +195,12 @@ mutable struct LangevinSplittingReweighting{K,T,F,NB,FB,PF1,PF2} <: AbstractRewe
     log_weights::Vector{T}
 end
 
-"""
-    LangevinSplittingReweighting(splitting, sys, sim, force_perturbations)
+function _make_reweighting(sys, sim::LangevinSplitting, force_perturbations)
 
-Girsanov trajectory reweighting for the [`LangevinSplitting`](@ref) simulator.
-
-Accumulates path log-weights for future reweighting of trajectories sampled
-under `sim` to a target dynamics whose force function differs by the sum of
-`force_perturbations`. The running log-weights are stored in `log_weights`
-and updated once per step.
-Currently only the `"ABOBA"` splitting is supported; `splitting` must match
-`sim.splitting`. Not compatible with `sim.remove_CM_motion != 0`.
-
-# Arguments
-- `splitting::AbstractString`: the splitting scheme; must match `sim.splitting`
-    and appear in `Molly._girsanov_implemented_splittings`.
-- `sys`: the [`System`](@ref) being simulated.
-- `sim::LangevinSplitting`: the reference simulator generating the trajectory.
-- `force_perturbations`: an iterable of interactions giving the
-    difference in force functions between the target and reference dynamics.
-
-Interactions in `force_perturbations` should implement a method for `AtomsCalculators.forces!`, see [General interactions](@ref).
-"""
-function LangevinSplittingReweighting(splitting, sys, sim, force_perturbations)
+    splitting = String(sim.splitting)
 
     if !(splitting in _girsanov_implemented_splittings)
         throw(ArgumentError("Splitting $(splitting) is not available for Girsanov reweighting. Available splittings: $(join(_girsanov_implemented_splittings,", "))."))
-    end
-
-    if splitting != sim.splitting
-        throw(ArgumentError("Reweighting splitting ($(splitting)) does not match simulator splitting ($(sim.splitting))."))
-    end
-
-    if !iszero(sim.remove_CM_motion)
-        throw(ArgumentError("LangevinSplittingReweighting is not compatible with sim.remove_CM_motion = 1 "))
     end
 
     T = float_type(sys)
@@ -317,7 +263,7 @@ function _reweighting_callback_aboba!(rw::LangevinSplittingReweighting{K,T},
     end
 end
 
-mutable struct MultipleLangevinSplittingReweighting{K,T,FB,LP,NB,FM,VB,GB,PF1,PF2} <: AbstractReweighting
+mutable struct MultipleLangevinSplittingReweighting{K,T,FB,LP,NB,FM,SFM,VB,GB,PF1,PF2} <: AbstractReweighting
     splitting::String
     feature_basis::FB
     linear_parameters::LP
@@ -326,6 +272,7 @@ mutable struct MultipleLangevinSplittingReweighting{K,T,FB,LP,NB,FM,VB,GB,PF1,PF
 
     noise_velocity_buffer::NTuple{K,NB}
     feature_buffer::NTuple{K,FM}
+    scaled_feature_buffer::NTuple{K,SFM}
     v_buffer::VB
     gram_buffer::GB
 
@@ -333,44 +280,12 @@ mutable struct MultipleLangevinSplittingReweighting{K,T,FB,LP,NB,FM,VB,GB,PF1,PF
     η_dot_Δη_prefactor::NTuple{K,PF2}
 end
 
-raw"""
-    MultipleLangevinSplittingReweighting(splitting, sys, sim, feature_basis, linear_parameters)
+function _make_reweighting(sys, sim::LangevinSplitting, feature_basis, linear_parameters)
 
-Simultaneous reweighting to multiple path ensembles for the [`LangevinSplitting`](@ref)
-simulator, for linear perturbations of the form
-
-    ```math
-        \delta F(x) = \theta^\top D(x)
-    ```
-
-    where \(D(x)\) is a basis of descriptors, and \(\theta\) is a vector of linear weights.
-
-One running log-weight is accumulated per column of `linear_parameters` and stored
-in `log_weights`. Currently only the `"ABOBA"` splitting is supported; `splitting`
-must match `sim.splitting`. Not compatible with `sim.remove_CM_motion != 0`.
-
-# Arguments
-- `splitting::AbstractString`: the splitting scheme; must match `sim.splitting`
-    and appear in `Molly._girsanov_implemented_splittings`.
-- `sys`: the [`System`](@ref) being simulated.
-- `sim::LangevinSplitting`: the reference simulator generating the trajectory.
-- `feature_basis`: a callable mapping `sys` to an `(N atoms) × (N features)` array of
-    3-vectors `D(x)`, the basis of force descriptors.
-- `linear_parameters`: an `(N features) × (N ensembles)` matrix `Θ` whose columns
-    are the linear weights `θ` defining each target dynamics.
-"""
-function MultipleLangevinSplittingReweighting(splitting, sys, sim, feature_basis, linear_parameters)
+    splitting = String(sim.splitting)
 
     if !(splitting in _girsanov_implemented_splittings)
         throw(ArgumentError("Splitting $(splitting) is not available for Girsanov reweighting. Available splittings: $(join(_girsanov_implemented_splittings,", "))."))
-    end
-
-    if splitting != sim.splitting
-        throw(ArgumentError("Reweighting splitting ($(splitting)) does not match simulator splitting ($(sim.splitting))."))
-    end
-
-    if !iszero(sim.remove_CM_motion)
-        throw(ArgumentError("MultipleLangevinSplittingReweighting is not compatible with sim.remove_CM_motion = 1 "))
     end
 
     T = float_type(sys)
@@ -398,14 +313,16 @@ function MultipleLangevinSplittingReweighting(splitting, sys, sim, feature_basis
     feature_buffer = NTuple{K}(copy(feature_buffer_) for i = 1:K)
     noise_velocity_buffer = NTuple{K}(zero(η_dot_Δη_prefactor[i] .* sys.velocities) for i = 1:K)
 
+    scaled_feature_buffer = NTuple{K}(zero(sqrt_Δη_squared_prefactor[i] .* feature_buffer_) for i = 1:K)
+
     v_buffer = zero(feature_buffer_' * (η_dot_Δη_prefactor[1] .* sys.velocities))
-    gram_buffer = zero((sqrt_Δη_squared_prefactor[1] .* feature_buffer_)' * (sqrt_Δη_squared_prefactor[1] .* feature_buffer_))
+    gram_buffer = zero(scaled_feature_buffer[1]' * scaled_feature_buffer[1])
 
     log_weights = Vector{T}[]
 
     return MultipleLangevinSplittingReweighting(
         String(splitting), feature_basis, linear_parameters, log_weights,
-        noise_velocity_buffer, feature_buffer, v_buffer, gram_buffer,
+        noise_velocity_buffer, feature_buffer, scaled_feature_buffer, v_buffer, gram_buffer,
         sqrt_Δη_squared_prefactor, η_dot_Δη_prefactor,
     )
 end
@@ -437,8 +354,8 @@ function _reweighting_callback_aboba!(rw::MultipleLangevinSplittingReweighting{K
 
         mul!(rw.v_buffer, rw.feature_buffer[1]', rw.noise_velocity_buffer[1])
 
-        rw.feature_buffer[1] .*= rw.sqrt_Δη_squared_prefactor[1]
-        mul!(rw.gram_buffer, rw.feature_buffer[1]', rw.feature_buffer[1])
+        rw.scaled_feature_buffer[1] .= rw.sqrt_Δη_squared_prefactor[1] .* rw.feature_buffer[1]
+        mul!(rw.gram_buffer, rw.scaled_feature_buffer[1]', rw.scaled_feature_buffer[1])
 
         Δη_squared = ustrip_vec(NoUnits, vec(sum(Θ .* (rw.gram_buffer * Θ); dims=1)))
         η_dot_Δη = ustrip_vec(NoUnits, Θ' * rw.v_buffer)
@@ -453,3 +370,28 @@ function _reweighting_callback_aboba!(rw::MultipleLangevinSplittingReweighting{K
     end
 
 end
+
+function TrajectoryReweighting(sys, sim;
+    force_perturbations=nothing, feature_basis=nothing, linear_parameters=nothing)
+
+    if !iszero(sim.remove_CM_motion)
+        throw(ArgumentError("TrajectoryReweighting is not compatible with sim.remove_CM_motion = 1 "))
+    end
+
+    scheme = if force_perturbations !== nothing
+        (feature_basis === nothing && linear_parameters === nothing) ||
+            throw(ArgumentError("Supply either `force_perturbations`, or " *
+                                "`feature_basis` and `linear_parameters`, not both."))
+        _make_reweighting(sys, sim, force_perturbations)
+    elseif feature_basis !== nothing && linear_parameters !== nothing
+        _make_reweighting(sys, sim, feature_basis, linear_parameters)
+    else
+        throw(ArgumentError("Supply either `force_perturbations`, or both " *
+                            "`feature_basis` and `linear_parameters`."))
+    end
+
+    return TrajectoryReweighting{typeof(scheme),typeof(scheme.log_weights)}(scheme, scheme.log_weights)
+end
+
+_reweighting_callback!(rw::TrajectoryReweighting, args...) =
+    _reweighting_callback!(rw.scheme, args...)
