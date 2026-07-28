@@ -1,13 +1,26 @@
 # KernelAbstractions.jl kernels, CUDA kernels are in an extension
 
-@inline function sum_pairwise_forces(inters, atom_i, atom_j, ::Val{F}, special, coord_i, coord_j,
-                                     boundary, vel_i, vel_j, step_n) where F
+@inline function sum_pairwise_forces_gpu(inters::Tuple{T}, dr, atom_i, atom_j, ::Val{F},
+                                         special, coord_i, coord_j, boundary, vel_i, vel_j,
+                                         step_n) where {T, F}
+    return force_gpu(inters[1], dr, atom_i, atom_j, F, special, coord_i, coord_j, boundary,
+                     vel_i, vel_j, step_n)
+end
+
+@inline function sum_pairwise_forces_gpu(inters::Tuple, dr, atom_i, atom_j, ::Val{F},
+                                         special, coord_i, coord_j, boundary, vel_i, vel_j,
+                                         step_n) where F
+    return force_gpu(first(inters), dr, atom_i, atom_j, F, special, coord_i, coord_j, boundary,
+                     vel_i, vel_j, step_n) +
+           sum_pairwise_forces_gpu(Base.tail(inters), dr, atom_i, atom_j, Val(F), special,
+                                   coord_i, coord_j, boundary, vel_i, vel_j, step_n)
+end
+
+@inline function sum_pairwise_forces_nonl(inters::Tuple, atom_i, atom_j, ::Val{F}, special,
+                                          coord_i, coord_j, boundary, vel_i, vel_j, step_n) where F
     dr = vector(coord_i, coord_j, boundary)
-    f_tuple = ntuple(length(inters)) do inter_type_i
-        force_gpu(inters[inter_type_i], dr, atom_i, atom_j, F, special, coord_i, coord_j, boundary,
-                  vel_i, vel_j, step_n)
-    end
-    f = sum(f_tuple)
+    f = sum_pairwise_forces_gpu(inters, dr, atom_i, atom_j, Val(F), special, coord_i, coord_j,
+                                boundary, vel_i, vel_j, step_n)
     if unit(f[1]) != F
         # This triggers an error but it isn't printed
         # See https://discourse.julialang.org/t/error-handling-in-cuda-kernels/79692
@@ -17,29 +30,62 @@
     return f
 end
 
-@inline function sum_pairwise_potentials(inters, atom_i, atom_j, ::Val{E}, special, coord_i, coord_j,
-                                         boundary, vel_i, vel_j, step_n) where E
+@inline function sum_pairwise_potentials_gpu(inters::Tuple{T}, dr, atom_i, atom_j, ::Val{E},
+                                             special, coord_i, coord_j, boundary, vel_i, vel_j,
+                                             step_n) where {T, E}
+    # SVector is required to avoid a GPU error occurring with scalars
+    return SVector(potential_energy_gpu(inters[1], dr, atom_i, atom_j, E, special,
+                                        coord_i, coord_j, boundary, vel_i, vel_j, step_n))
+end
+
+@inline function sum_pairwise_potentials_gpu(inters::Tuple, dr, atom_i, atom_j, ::Val{E},
+                                             special, coord_i, coord_j, boundary, vel_i, vel_j,
+                                             step_n) where E
+    return SVector(potential_energy_gpu(first(inters), dr, atom_i, atom_j, E, special,
+                                        coord_i, coord_j, boundary, vel_i, vel_j, step_n)) +
+           sum_pairwise_potentials_gpu(Base.tail(inters), dr, atom_i, atom_j, Val(E), special,
+                                       coord_i, coord_j, boundary, vel_i, vel_j, step_n)
+end
+
+@inline function sum_pairwise_potentials_nonl(inters, atom_i, atom_j, ::Val{E}, special, coord_i,
+                                              coord_j, boundary, vel_i, vel_j, step_n) where E
     dr = vector(coord_i, coord_j, boundary)
-    pe_tuple = ntuple(length(inters)) do inter_type_i
-        # SVector was required to avoid a GPU error occurring with scalars
-        SVector(potential_energy_gpu(inters[inter_type_i], dr, atom_i, atom_j, E, special,
-                            coord_i, coord_j, boundary, vel_i, vel_j, step_n))
-    end
-    pe = sum(pe_tuple)
+    pe = sum_pairwise_potentials_gpu(inters, dr, atom_i, atom_j, Val(E), special, coord_i,
+                                     coord_j, boundary, vel_i, vel_j, step_n)
     if unit(pe[1]) != E
         error("wrong force unit returned, was expecting $E but got $(unit(pe[1]))")
     end
     return pe
 end
 
-function gpu_threads_pairwise(n_neighbors)
-    n_threads_gpu = parse(Int, get(ENV, "MOLLY_GPUNTHREADS_PAIRWISE", "512"))
-    return n_threads_gpu
+function gpu_threads_env(name, default)
+    return haskey(ENV, name) ? parse(Int, ENV[name]) : default
 end
 
-function gpu_threads_specific(n_inters)
-    n_threads_gpu = parse(Int, get(ENV, "MOLLY_GPUNTHREADS_SPECIFIC", "32"))
-    return n_threads_gpu
+gpu_threads_pairwise(n_neighbors) = gpu_threads_env("MOLLY_GPUNTHREADS_PAIRWISE", 512)
+gpu_threads_specific(n_inters) = gpu_threads_env("MOLLY_GPUNTHREADS_SPECIFIC", 32)
+gpu_threads_copy(n_items) = gpu_threads_env("MOLLY_GPUNTHREADS_COPY", 256)
+
+@inline apply_force_units_gpu(f, ::Val{force_units}) where {force_units} = f .* force_units
+@inline apply_force_units_gpu(f, ::Val{NoUnits}) = f
+
+function apply_force_units_gpu!(fs::AbstractGPUArray, fs_mat, force_units,
+                                ::Val{D}, ::Val{T}) where {D, T}
+    backend = get_backend(fs)
+    n_threads_gpu = gpu_threads_copy(length(fs))
+    kernel! = apply_force_units_kernel!(backend, n_threads_gpu)
+    kernel!(fs, fs_mat, Val(force_units), Val(D), Val(T); ndrange=length(fs))
+    return fs
+end
+
+@kernel inbounds=true function apply_force_units_kernel!(fs, @Const(fs_mat),
+                                         ::Val{force_units}, ::Val{D},
+                                         ::Val{T}) where {force_units, D, T}
+    atom_i = @index(Global, Linear)
+    if atom_i <= length(fs)
+        f = SVector{D, T}(ntuple(dim -> fs_mat[dim, atom_i], Val(D)))
+        fs[atom_i] = apply_force_units_gpu(f, Val(force_units))
+    end
 end
 
 function pairwise_forces_loop_gpu!(buffers, sys::System{D, <:AbstractGPUArray},
@@ -74,10 +120,12 @@ end
 
     if inter_i <= length(neighbors)
         i, j, special = neighbors[inter_i]
-        dr = vector(coords[i], coords[j], boundary)
-        f = sum_pairwise_forces(inters, atoms[i], atoms[j], Val(F), special, coords[i], coords[j],
-                                boundary, velocities[i], velocities[j], step_n)
-        dr = vector(coords[i], coords[j], boundary)
+        coord_i = coords[i]
+        coord_j = coords[j]
+        dr = vector(coord_i, coord_j, boundary)
+        f = sum_pairwise_forces_gpu(inters, dr, atoms[i], atoms[j], Val(F), special,
+                                    coord_i, coord_j, boundary, velocities[i], velocities[j],
+                                    step_n)
         for dim in 1:D
             fval = ustrip(f[dim])
             Atomix.@atomic fs_mat[dim, i] += -fval
@@ -169,13 +217,13 @@ end
         if unit(fs.f1[1]) != F
             error("wrong force unit returned, was expecting $F")
         end
-        coord_vals = ntuple(col -> ustrip(coords[i][col]), D)
         for dim in 1:D
             fval = ustrip(fs.f1[dim])
             Atomix.@atomic fs_mat[dim, i] += fval
             if needs_vir
+                λ = λ_mixing(MinimumMixing(), atoms[i], atoms[i])
                 @inbounds for alpha in 1:D
-                    Atomix.@atomic vir[alpha, dim] += ustrip(coords[i][alpha]) * ustrip(fs.f1[dim])
+                    Atomix.@atomic vir[alpha, dim] += λ * ustrip(coords[i][alpha]) * fval
                 end
             end
         end
@@ -188,6 +236,7 @@ end
                                         ::Val{needs_vir}, ::Val{D},
                                         ::Val{F}) where {needs_vir, D, F}
     inter_i = @index(Global, Linear)
+
     if inter_i <= length(is)
         i, j = is[inter_i], js[inter_i]
         fs = force_gpu(inters[inter_i], coords[i], coords[j], boundary, atoms[i], atoms[j], F,
@@ -202,8 +251,10 @@ end
             Atomix.@atomic fs_mat[dim, j] += f2val
             if needs_vir
                 r_ji = vector(coords[j], coords[i], boundary) # Second atom is the reference
+                # Ewald exclusions are already lambda-weighted through charge scaling
+                λ = inters[inter_i] isa EwaldExclusion ? 1 : λ_mixing(MinimumMixing(), atoms[i], atoms[j])
                 @inbounds for alpha in 1:D
-                    Atomix.@atomic vir[alpha, dim] += ustrip(r_ji[alpha]) * ustrip(fs.f1[dim])
+                    Atomix.@atomic vir[alpha, dim] += λ * ustrip(r_ji[alpha]) * f1val
                 end
             end
         end
@@ -216,7 +267,6 @@ end
                                         @Const(data), ::Val{needs_vir}, ::Val{D},
                                         ::Val{F}) where {needs_vir, D, F}
     inter_i = @index(Global, Linear)
-    FT = eltype(fs_mat)
 
     if inter_i <= length(is)
         i, j, k = is[inter_i], js[inter_i], ks[inter_i]
@@ -236,9 +286,12 @@ end
             if needs_vir
                 r_ji = vector(coords[j], coords[i], boundary) # r_i - r_j (second atom is the reference, MIC)
                 r_jk = vector(coords[j], coords[k], boundary) # r_k - r_j (second atom is the reference)
+                λ_ji = λ_mixing(MinimumMixing(), atoms[j], atoms[i])
+                λ_jk = λ_mixing(MinimumMixing(), atoms[j], atoms[k])
+                λ = minimum((λ_ji, λ_jk))
                 @inbounds for alpha in 1:D
-                    Atomix.@atomic vir[alpha, dim] += (ustrip(r_ji[alpha]) * ustrip(fs.f1[dim]) +
-                                                       ustrip(r_jk[alpha]) * ustrip(fs.f3[dim]))
+                    Atomix.@atomic vir[alpha, dim] += (λ * ustrip(r_ji[alpha]) * f1val +
+                                                       λ * ustrip(r_jk[alpha]) * f3val)
                 end
             end
         end
@@ -251,7 +304,6 @@ end
                                         @Const(inters), @Const(data), ::Val{needs_vir}, ::Val{D},
                                         ::Val{F}) where {needs_vir, D, F}
     inter_i = @index(Global, Linear)
-    FT = eltype(fs_mat)
 
     if inter_i <= length(is)
         i, j, k, l = is[inter_i], js[inter_i], ks[inter_i], ls[inter_i]
@@ -275,10 +327,14 @@ end
                 r_ji = vector(coords[j], coords[i], boundary) # r_i - r_j
                 r_jk = vector(coords[j], coords[k], boundary) # r_k - r_j
                 r_jl = vector(coords[j], coords[l], boundary) # r_l - r_j
+                λ_ji = λ_mixing(MinimumMixing(), atoms[j], atoms[i])
+                λ_jk = λ_mixing(MinimumMixing(), atoms[j], atoms[k])
+                λ_jl = λ_mixing(MinimumMixing(), atoms[j], atoms[l])
+                λ = minimum((λ_ji, λ_jk, λ_jl))
                 @inbounds for alpha in 1:D
-                    Atomix.@atomic vir[alpha, dim] += (ustrip(r_ji[alpha]) * ustrip(fs.f1[dim]) +
-                                                       ustrip(r_jk[alpha]) * ustrip(fs.f3[dim]) +
-                                                       ustrip(r_jl[alpha]) * ustrip(fs.f4[dim]))
+                    Atomix.@atomic vir[alpha, dim] += (λ * ustrip(r_ji[alpha]) * f1val +
+                                                       λ * ustrip(r_jk[alpha]) * f3val +
+                                                       λ * ustrip(r_jl[alpha]) * f4val)
                 end
             end
         end
@@ -291,7 +347,6 @@ end
                                         @Const(inters), @Const(data), ::Val{needs_vir}, ::Val{D},
                                         ::Val{F}) where {needs_vir, D, F}
     inter_i = @index(Global, Linear)
-    FT = eltype(fs_mat)
 
     if inter_i <= length(is)
         i, j, k, l, m = is[inter_i], js[inter_i], ks[inter_i], ls[inter_i], ms[inter_i]
@@ -319,11 +374,16 @@ end
                 r_jk = vector(coords[j], coords[k], boundary) # r_k - r_j
                 r_jl = vector(coords[j], coords[l], boundary) # r_l - r_j
                 r_jm = vector(coords[j], coords[m], boundary) # r_m - r_j
+                λ_ji = λ_mixing(MinimumMixing(), atoms[j], atoms[i])
+                λ_jk = λ_mixing(MinimumMixing(), atoms[j], atoms[k])
+                λ_jl = λ_mixing(MinimumMixing(), atoms[j], atoms[l])
+                λ_jm = λ_mixing(MinimumMixing(), atoms[j], atoms[m])
+                λ = minimum((λ_ji, λ_jk, λ_jl, λ_jm))
                 @inbounds for alpha in 1:D
-                    Atomix.@atomic vir[alpha, dim] += (ustrip(r_ji[alpha]) * ustrip(fs.f1[dim]) +
-                                                       ustrip(r_jk[alpha]) * ustrip(fs.f3[dim]) +
-                                                       ustrip(r_jl[alpha]) * ustrip(fs.f4[dim]) +
-                                                       ustrip(r_jm[alpha]) * ustrip(fs.f5[dim]))
+                    Atomix.@atomic vir[alpha, dim] += (λ * ustrip(r_ji[alpha]) * f1val +
+                                                       λ * ustrip(r_jk[alpha]) * f3val +
+                                                       λ * ustrip(r_jl[alpha]) * f4val +
+                                                       λ * ustrip(r_jm[alpha]) * f5val)
                 end
             end
         end
@@ -358,8 +418,8 @@ end
 
     if inter_i <= length(neighbors)
         i, j, special = neighbors[inter_i]
-        pe = sum_pairwise_potentials(inters, atoms[i], atoms[j], Val(E), special, coords[i],
-                                     coords[j], boundary, velocities[i], velocities[j], step_n)[1]
+        pe = sum_pairwise_potentials_nonl(inters, atoms[i], atoms[j], Val(E), special, coords[i],
+                                coords[j], boundary, velocities[i], velocities[j], step_n)[1]
         if unit(pe) != E
             error("wrong energy unit returned, was expecting $E but got $(unit(pe))")
         end
@@ -591,13 +651,121 @@ end
     end
 end
 
-@kernel function reverse_reorder_forces_kernel!(fs_mat, @Const(fs_reordered), @Const(seq))
+@kernel function reverse_reorder_forces_kernel!(fs_mat, @Const(fs_reordered), @Const(seq),
+                                                ::Val{D}) where D
     i = @index(Global, Linear)
-    D = size(fs_mat, 1)
     @inbounds if i <= length(seq)
         orig_idx = seq[i]
         for d in 1:D
             fs_mat[d, orig_idx] += fs_reordered[d, i]
         end
     end
+end
+
+# `Float32` gets a dedicated
+# method; any other `AbstractFloat` (including `Float64`) falls back to
+# drawing in `Float64` and converting.
+# After calling this advance ctr0 by at least 2*natoms
+@inline function randn_svec(::Type{SVector{2, Float32}}, ctr0::UInt64, ctr1::UInt64, key::UInt64, natoms::UInt64)
+    c1, c2, c3, c4 = randn_f32(ctr0, ctr1, key)
+    SVector{2, Float32}(c1, c2)
+end
+@inline function randn_svec(::Type{SVector{3, Float32}}, ctr0::UInt64, ctr1::UInt64, key::UInt64, natoms::UInt64)
+    c1, c2, c3, c4 = randn_f32(ctr0, ctr1, key)
+    SVector{3, Float32}(c1, c2, c3)
+end
+@inline function randn_svec(::Type{SVector{2, FT}}, ctr0::UInt64, ctr1::UInt64, key::UInt64, natoms::UInt64) where {FT <: AbstractFloat}
+    c1, c2 = randn_f64(ctr0, ctr1, key)
+    SVector{2, FT}(c1, c2)
+end
+@inline function randn_svec(::Type{SVector{3, FT}}, ctr0::UInt64, ctr1::UInt64, key::UInt64, natoms::UInt64) where {FT <: AbstractFloat}
+    c1, c2 = randn_f64(ctr0, ctr1, key)
+    ctr0 += natoms
+    c3, c4 = randn_f64(ctr0, ctr1, key)
+    SVector{3, FT}(c1, c2, c3)
+end
+
+@kernel function random_velocities_kernel!(
+        vels::AbstractVector{SVector{D, C}}, @Const(masses::AbstractVector),
+        kT, @Const(virtual_sites), ctr1::UInt64, key::UInt64, ::Val{FT}
+    ) where {D, C, FT}
+    i = @index(Global, Linear)
+    natoms = length(vels)%UInt64
+    ctr0 = i%UInt64
+    @inbounds if i <= length(vels)
+        if !virtual_sites[i]
+            scale = C(sqrt(kT / masses[i]))
+            vels[i] = randn_svec(SVector{D, FT}, ctr0, ctr1, key, natoms) * scale
+        else
+            vels[i] = zero(SVector{D, C})
+        end
+    end
+end
+
+@kernel function apply_andersen_coupling_kernel!(
+        vels::AbstractVector{SVector{D, C}}, @Const(masses::AbstractVector),
+        kT, prob_val_u64::UInt64, @Const(virtual_sites), ctr1::UInt64, key::UInt64, ::Val{FT}
+    ) where {D, C, FT}
+    i = @index(Global, Linear)
+    natoms = length(vels)%UInt64
+    ctr0 = i%UInt64
+    @inbounds if i<= length(vels) && !virtual_sites[i]
+        u0, u1 = philox4x32_10(ctr0, ctr1, key)
+        rand_u64 = (UInt64(u0) | UInt64(u1)<<Int32(32))
+        if rand_u64 < prob_val_u64
+            ctr0 += natoms # advance the rng natoms
+            scale = C(sqrt(kT/masses[i]))
+            vels[i] = randn_svec(SVector{D, FT}, ctr0, ctr1, key, natoms) * scale
+        end
+    end
+end
+
+# Fused inner part of a Langevin step
+@kernel function langevin_o_step_kernel!(
+        vels::AbstractVector{SVector{D, C}},
+        @Const(vel_scales::AbstractVector),
+        @Const(noise_scales::AbstractVector),
+        philox_ctr1::UInt64,
+        philox_key::UInt64,
+        ::Val{FT},
+    ) where {D, C, FT}
+    i = @index(Global, Linear)
+    natoms = length(vels)%UInt64
+    philox_ctr0 = i%UInt64
+    @inbounds if i<= length(vels)
+        noise = randn_svec(SVector{D, FT}, philox_ctr0, philox_ctr1, philox_key, natoms)
+        vels[i] = muladd(vel_scales[i], vels[i], noise*noise_scales[i])
+    end
+end
+# host
+function langevin_o_step!(
+        vels::AbstractVector{SVector{D, C}},
+        vel_scales::AbstractVector,
+        noise_scales::AbstractVector,
+        philox_ctr1::UInt64,
+        philox_key::UInt64,
+        ::Type{FT},
+    ) where {D, C, FT}
+    natoms = UInt64(length(vels))
+    @inbounds @simd ivdep for i in eachindex(vels, vel_scales, noise_scales)
+        philox_ctr0 = i%UInt64
+        noise = randn_svec(SVector{D, FT}, philox_ctr0, philox_ctr1, philox_key, natoms)
+        vels[i] = muladd(vel_scales[i], vels[i], noise*noise_scales[i])
+    end
+    nothing
+end
+# device
+function langevin_o_step!(
+            vels::AbstractGPUArray,
+            vel_scales::AbstractVector,
+            noise_scales::AbstractVector,
+            philox_ctr1::UInt64,
+            philox_key::UInt64,
+            ::Type{FT},
+        ) where {FT}
+    backend = get_backend(vels)
+    kernel! = langevin_o_step_kernel!(backend)
+    kernel!(vels, vel_scales, noise_scales, philox_ctr1, philox_key,
+            Val{FT}(); ndrange=length(vels))
+    nothing
 end
